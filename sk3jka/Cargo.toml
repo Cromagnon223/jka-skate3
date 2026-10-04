@@ -1,0 +1,20 @@
+[package]
+name = "sk3jka"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "C interface to the Skate 3 Rust engine for the Jedi Academy skate mod"
+
+[lib]
+crate-type = ["cdylib"]
+
+[workspace]
+
+[dependencies]
+skate-host = { path = "../chasm/skate/crates/skate-host" }
+bevy = { version = "0.19", default-features = false, features = ["std", "multi_threaded", "bevy_log"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
