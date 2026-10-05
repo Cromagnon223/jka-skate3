@@ -20,6 +20,10 @@ jobs:
           git fetch -q --depth 1 https://github.com/chasmlol/2010-rust-rewrite-mashup.git $CHASM_REV
           git checkout -q FETCH_HEAD
 
+      - name: Patch engine (skip unfinished features instead of crashing)
+        shell: bash
+        run: python patches/apply.py
+
       - name: Get SK8-ENGINE (converter tools)
         shell: bash
         run: |
