@@ -407,6 +407,10 @@ fn worker(generation: u64, root: PathBuf, raw: Vec<f32>, jobs: mpsc::Receiver<Jo
     ));
     drop(tris);
     let rails = sanitize_rails(found);
+    // Kept so the engine can be rebuilt from scratch if its physics ever gets
+    // into a state a simple re-activate can't fix.
+    let keep_triangles = triangles.clone();
+    let keep_rails = rails.clone();
     let mut session = Session::new(&root, triangles, rails, [0.; 3], 0.)?;
     log(&format!("engine loaded in {}ms", start.elapsed().as_millis()));
     {
@@ -537,17 +541,30 @@ fn worker(generation: u64, root: PathBuf, raw: Vec<f32>, jobs: mpsc::Receiver<Jo
                     }
                     spot[1] += 0.05; // a little above the ground
                     accumulated = 0.;
-                    match session.activate(spot, h) {
-                        Ok(p) if pose_ok(&p) => {
+                    let quick = match session.activate(spot, h) {
+                        Ok(p) if pose_ok(&p) => Ok(p),
+                        Ok(_) => Err("invalid pose".to_string()),
+                        Err(e2) => Err(e2),
+                    };
+                    match quick {
+                        Ok(p) => {
                             publisher.publish(p, controller, session.period(), Some(STATUS_ACTIVE));
                         }
-                        Ok(_) => {
-                            mark_step_done(seq);
-                            return Err(format!("{e}; recovery produced an invalid pose"));
-                        }
                         Err(e2) => {
+                            // Last resort: rebuild the whole engine (a few seconds
+                            // of "loading") and drop back in at the same spot.
+                            log(&format!("quick recovery failed ({e2}); rebuilding the engine"));
+                            set_status(generation, STATUS_LOADING);
                             mark_step_done(seq);
-                            return Err(format!("{e}; recovery failed: {e2}"));
+                            session = Session::new(&root, keep_triangles.clone(), keep_rails.clone(), [0.; 3], 0.)
+                                .map_err(|e3| format!("{e}; rebuild failed: {e3}"))?;
+                            let p = session.activate(spot, h).map_err(|e3| format!("{e}; rebuild activate failed: {e3}"))?;
+                            if !pose_ok(&p) {
+                                return Err(format!("{e}; rebuilt engine produced an invalid pose"));
+                            }
+                            transport = ControllerTransport::default();
+                            publisher.publish(p, controller, session.period(), Some(STATUS_ACTIVE));
+                            log("engine rebuilt");
                         }
                     }
                 }
