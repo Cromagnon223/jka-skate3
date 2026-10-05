@@ -193,6 +193,9 @@ struct Shared {
     generation: u64,
     /// engine tick length in seconds, 0 until loaded
     period: f32,
+    /// short on-screen message for the game (respawn point set, ...)
+    notice: String,
+    notice_seq: u64,
 }
 
 static SHARED: Mutex<Shared> = Mutex::new(Shared {
@@ -204,6 +207,8 @@ static SHARED: Mutex<Shared> = Mutex::new(Shared {
     log: None,
     generation: 0,
     period: 0.,
+    notice: String::new(),
+    notice_seq: 0,
 });
 
 fn shared() -> std::sync::MutexGuard<'static, Shared> {
@@ -227,6 +232,28 @@ fn fail(generation: u64, msg: String) {
         s.error = msg;
     }
 }
+
+fn notify(generation: u64, msg: &str) {
+    let mut s = shared();
+    if s.generation == generation {
+        s.notice.clear();
+        s.notice.push_str(msg);
+        s.notice_seq = s.notice_seq.wrapping_add(1);
+    }
+}
+
+/// Yaw (radians, engine convention) of a skater root, inverse of the
+/// Quat::from_rotation_y(heading) the bridge uses when activating.
+fn heading_of(root: &Mat4) -> f32 {
+    let x = root.x_axis;
+    let h = (-x.z).atan2(x.x);
+    if h.is_finite() { h } else { 0. }
+}
+
+/// D-pad up on the controller (XInput bit 0).
+const DPAD_UP: u16 = 0x0001;
+/// Hold this long to set the respawn point; shorter taps return to it.
+const RESPAWN_HOLD: f32 = 0.5;
 
 fn set_status(generation: u64, status: i32) {
     let mut s = shared();
@@ -430,6 +457,11 @@ fn worker(generation: u64, root: PathBuf, raw: Vec<f32>, jobs: mpsc::Receiver<Jo
     let mut last_good: Option<([f32; 3], f32)> = None;
     let mut recoveries = 0u32;
     let mut recovery_since = std::time::Instant::now();
+    // Respawn point: hold D-pad up to set, tap to go back.
+    let mut last_root: Option<Mat4> = None;
+    let mut respawn: Option<([f32; 3], f32)> = None;
+    let mut dpad_hold = 0f32;
+    let mut dpad_placed = false;
     // A job taken off the queue while coalescing steps, handled next.
     let mut next: Option<Job> = None;
     loop {
@@ -449,6 +481,7 @@ fn worker(generation: u64, root: PathBuf, raw: Vec<f32>, jobs: mpsc::Receiver<Jo
                     return Err("the skate engine produced an invalid pose".into());
                 }
                 last_good = Some((p.root.w_axis.truncate().to_array(), heading));
+                last_root = Some(p.root);
                 recoveries = 0;
                 active = true;
                 publisher.publish(p, None, session.period(), Some(STATUS_ACTIVE));
@@ -490,6 +523,7 @@ fn worker(generation: u64, root: PathBuf, raw: Vec<f32>, jobs: mpsc::Receiver<Jo
                 }
                 let frame = transport.poll();
                 let controller = frame.controller();
+                let dpad_up = frame.buttons() & DPAD_UP != 0;
                 session.set_aspect_ratio(aspect);
                 session.collect(frame, dt);
                 accumulated = (accumulated + dt).min(MAX_CATCH_UP);
@@ -516,6 +550,7 @@ fn worker(generation: u64, root: PathBuf, raw: Vec<f32>, jobs: mpsc::Receiver<Jo
                     let p = session.pose();
                     if pose_ok(&p) {
                         last_good = Some((p.root.w_axis.truncate().to_array(), heading));
+                        last_root = Some(p.root);
                         publisher.publish(p, controller, session.period(), None);
                     } else {
                         broken = Some("the skate engine produced an invalid pose".into());
@@ -567,6 +602,41 @@ fn worker(generation: u64, root: PathBuf, raw: Vec<f32>, jobs: mpsc::Receiver<Jo
                             log("engine rebuilt");
                         }
                     }
+                }
+                // Respawn point (D-pad up): hold to set it, tap to return.
+                if dpad_up {
+                    dpad_hold += dt;
+                    if !dpad_placed && dpad_hold >= RESPAWN_HOLD {
+                        dpad_placed = true;
+                        if let Some(r) = last_root {
+                            respawn = Some((r.w_axis.truncate().to_array(), heading_of(&r)));
+                            notify(generation, "Respawn point set");
+                            log("respawn point set");
+                        }
+                    }
+                } else {
+                    if dpad_hold > 0. && !dpad_placed {
+                        match respawn {
+                            Some((mut spot, h)) => {
+                                spot[1] += 0.05;
+                                accumulated = 0.;
+                                match session.activate(spot, h) {
+                                    Ok(p) if pose_ok(&p) => {
+                                        heading = h;
+                                        last_good = Some((p.root.w_axis.truncate().to_array(), h));
+                                        last_root = Some(p.root);
+                                        publisher.publish(p, controller, session.period(), Some(STATUS_ACTIVE));
+                                        notify(generation, "Back to respawn point");
+                                    }
+                                    Ok(_) => log("respawn produced an invalid pose; ignored"),
+                                    Err(e) => log(&format!("respawn failed: {e}")),
+                                }
+                            }
+                            None => notify(generation, "Hold D-pad up to set a respawn point"),
+                        }
+                    }
+                    dpad_hold = 0.;
+                    dpad_placed = false;
                 }
                 mark_step_done(seq);
             }
@@ -737,6 +807,24 @@ pub unsafe extern "C" fn sk3_get_bones(out: *mut f32, max: i32) -> i32 {
 
 /// Optional (not used by API version 1 callers): the engine's current tick
 /// length in milliseconds, or 0 before the engine has loaded.
+/// Latest short on-screen message; returns a counter that changes with each
+/// new message (0 = none yet), so the game shows each one once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sk3_notice(buf: *mut c_char, len: i32) -> u32 {
+    guard(0, || {
+        let st = shared();
+        if !buf.is_null() && len > 0 {
+            let bytes = st.notice.as_bytes();
+            let n = bytes.len().min(len as usize - 1);
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, buf, n);
+                *buf.add(n) = 0;
+            }
+        }
+        st.notice_seq as u32
+    })
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn sk3_period_ms() -> f32 {
     guard(0., || shared().period * 1000.)
