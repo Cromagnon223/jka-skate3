@@ -196,6 +196,9 @@ struct Shared {
     /// short on-screen message for the game (respawn point set, ...)
     notice: String,
     notice_seq: u64,
+    /// D-pad respawn point in map space: feet x, y, z and Quake yaw (degrees),
+    /// so the game can spawn the player there after dying.
+    respawn: Option<[f32; 4]>,
 }
 
 static SHARED: Mutex<Shared> = Mutex::new(Shared {
@@ -209,6 +212,7 @@ static SHARED: Mutex<Shared> = Mutex::new(Shared {
     period: 0.,
     notice: String::new(),
     notice_seq: 0,
+    respawn: None,
 });
 
 fn shared() -> std::sync::MutexGuard<'static, Shared> {
@@ -609,7 +613,16 @@ fn worker(generation: u64, root: PathBuf, raw: Vec<f32>, jobs: mpsc::Receiver<Jo
                     if !dpad_placed && dpad_hold >= RESPAWN_HOLD {
                         dpad_placed = true;
                         if let Some(r) = last_root {
-                            respawn = Some((r.w_axis.truncate().to_array(), heading_of(&r)));
+                            let h = heading_of(&r);
+                            respawn = Some((r.w_axis.truncate().to_array(), h));
+                            let feet = from_skate(r.w_axis.truncate());
+                            let yaw = (h - std::f32::consts::FRAC_PI_2).to_degrees();
+                            {
+                                let mut s = shared();
+                                if s.generation == generation {
+                                    s.respawn = Some([feet.x, feet.y, feet.z, yaw]);
+                                }
+                            }
                             notify(generation, "Respawn point set");
                             log("respawn point set");
                         }
@@ -703,6 +716,7 @@ pub unsafe extern "C" fn sk3_start(root: *const c_char, log_path: *const c_char,
             st.bones.clear();
             st.names.clear();
             st.period = 0.;
+            st.respawn = None; // new map: the old point means nothing here
             st.log = log_path.map(PathBuf::from);
         }
         log(&format!("sk3jka {} starting, assets: {root}", env!("CARGO_PKG_VERSION")));
@@ -822,6 +836,20 @@ pub unsafe extern "C" fn sk3_notice(buf: *mut c_char, len: i32) -> u32 {
             }
         }
         st.notice_seq as u32
+    })
+}
+
+/// Optional: the D-pad respawn point as map feet x, y, z and Quake yaw
+/// (degrees) in `out[0..4]`. Returns 1 if one is set, else 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sk3_respawn_point(out: *mut f32) -> i32 {
+    guard(0, || {
+        let Some(rp) = shared().respawn else { return 0 };
+        if out.is_null() || !rp.iter().all(|c| c.is_finite()) {
+            return 0;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(rp.as_ptr(), out, 4) };
+        1
     })
 }
 
