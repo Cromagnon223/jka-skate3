@@ -528,8 +528,8 @@ fn worker(generation: u64, root: PathBuf, raw: Vec<f32>, jobs: mpsc::Receiver<Jo
                 let frame = transport.poll();
                 let controller = frame.controller();
                 let dpad_up = frame.buttons() & DPAD_UP != 0;
+                drop(frame);
                 session.set_aspect_ratio(aspect);
-                session.collect(frame, dt);
                 accumulated = (accumulated + dt).min(MAX_CATCH_UP);
                 let mut ticks = 0u32;
                 let mut broken: Option<String> = None;
@@ -544,6 +544,12 @@ fn worker(generation: u64, root: PathBuf, raw: Vec<f32>, jobs: mpsc::Receiver<Jo
                         break;
                     }
                     accumulated -= period;
+                    // One fresh controller reading per engine tick, like Skate 3
+                    // itself. Reading once per game frame let the engine skip
+                    // readings (it only keeps the newest) or see none on some
+                    // ticks, which made quick flicks - body flips need theirs
+                    // inside a short window at takeoff - sometimes not count.
+                    session.collect(transport.poll(), period);
                     if let Err(e) = session.advance() {
                         broken = Some(e);
                         break;
@@ -811,6 +817,12 @@ pub unsafe extern "C" fn sk3_get_bones(out: *mut f32, max: i32) -> i32 {
     }
     guard(0, || {
         let st = shared();
+        // sk3jka: once we're not actively skating, hand back no bones so the
+        // game animates the player normally again instead of holding the last
+        // skate pose (which survived respawns and broke saber animations).
+        if st.state.status != STATUS_ACTIVE {
+            return 0;
+        }
         let n = st.bones.len().min(max as usize);
         let src: &[f32] = st.bones[..n].as_flattened();
         // Pre-flattened by the worker: a straight copy under the lock.
